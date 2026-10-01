@@ -45,6 +45,14 @@ pub use oss::*;
 pub use s3::*;
 use serde::{Deserialize, Serialize};
 
+/// Per-I/O timeout in milliseconds for the OpenDAL storage implementation.
+///
+/// Must be a positive integer. When absent, OpenDAL's default of 10 seconds is
+/// used. Applies to individual I/O calls (including writer close) and multipart
+/// tasks, not the total time to transfer a file. Does not change the separate
+/// control-operation timeout. Native memory and filesystem storage ignore it.
+pub const CLIENT_IO_TIMEOUT_MS: &str = "client.io-timeout-ms";
+
 /// Configuration properties for storage backends.
 ///
 /// This struct contains only configuration properties without specifying

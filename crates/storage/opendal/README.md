@@ -21,6 +21,33 @@
 
 OpenDAL-based storage backend implementations for [Apache Iceberg Rust](https://rust.iceberg.apache.org/).
 
+## I/O timeout
+
+Set the FileIO property `client.io-timeout-ms` to a positive integer number of
+milliseconds to change the timeout for individual OpenDAL I/O calls. For example:
+
+```rust
+use std::sync::Arc;
+
+use iceberg::io::{CLIENT_IO_TIMEOUT_MS, FileIOBuilder};
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
+
+let file_io = FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
+    .with_prop(CLIENT_IO_TIMEOUT_MS, "120000")
+    .build();
+```
+
+This property applies to all OpenDAL backends through both explicit and resolving
+storage factories. It bounds each I/O attempt, including writer `write` and
+`close` calls and multipart upload tasks, rather than the total time to transfer
+a file. Retries receive the same configured timeout.
+
+When the property is absent, the existing 10-second I/O timeout is retained. The
+separate 60-second control-operation timeout is unchanged. Zero does not disable
+the timeout; zero, negative, malformed, or values exceeding `u64` are rejected
+with `DataInvalid` when storage is initialized, normally on the first FileIO
+operation. Native Iceberg memory and filesystem storage do not use this setting.
+
 ## Supported Storage Backends
 
 | Storage Backend      | Feature Flag     | Status          | Description                                   |

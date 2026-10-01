@@ -33,9 +33,10 @@ use iceberg::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::OpenDalStorage;
+use crate::config::io_timeout_from_props;
 #[cfg(feature = "opendal-s3")]
 use crate::s3::CustomAwsCredentialLoader;
+use crate::{ConfiguredStorage, OpenDalStorage};
 
 /// Schemes supported by OpenDalResolvingStorage
 pub const SCHEME_MEMORY: &str = "memory";
@@ -196,6 +197,7 @@ impl OpenDalResolvingStorageFactory {
 #[typetag::serde]
 impl StorageFactory for OpenDalResolvingStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        io_timeout_from_props(config.props())?;
         Ok(Arc::new(OpenDalResolvingStorage {
             props: config.props().clone(),
             storages: RwLock::new(HashMap::new()),
@@ -217,7 +219,7 @@ pub struct OpenDalResolvingStorage {
     props: HashMap<String, String>,
     /// Cache of canonical scheme to storage mappings.
     #[serde(skip, default)]
-    storages: RwLock<HashMap<&'static str, Arc<OpenDalStorage>>>,
+    storages: RwLock<HashMap<&'static str, Arc<ConfiguredStorage>>>,
     /// Custom AWS credential loader for S3 storage.
     #[cfg(feature = "opendal-s3")]
     #[serde(skip)]
@@ -227,7 +229,7 @@ pub struct OpenDalResolvingStorage {
 impl OpenDalResolvingStorage {
     /// Resolve the storage for the given path by extracting the canonical scheme and
     /// returning the cached or newly-created [`OpenDalStorage`].
-    fn resolve(&self, path: &str) -> Result<Arc<OpenDalStorage>> {
+    fn resolve(&self, path: &str) -> Result<Arc<ConfiguredStorage>> {
         let scheme = extract_scheme(path)?;
 
         // Fast path: check read lock first.
@@ -258,7 +260,10 @@ impl OpenDalResolvingStorage {
             #[cfg(feature = "opendal-s3")]
             &self.customized_credential_load,
         )?;
-        let storage = Arc::new(storage);
+        let storage = Arc::new(ConfiguredStorage {
+            storage,
+            io_timeout: io_timeout_from_props(&self.props)?,
+        });
         cache.insert(scheme, storage.clone());
         Ok(storage)
     }
@@ -377,18 +382,55 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "opendal-memory")]
+    #[tokio::test(start_paused = true)]
+    async fn test_resolved_storage_retains_timeout() {
+        use std::time::Duration;
+
+        use iceberg::io::CLIENT_IO_TIMEOUT_MS;
+
+        let mut resolver = empty_resolving_storage();
+        resolver
+            .props
+            .insert(CLIENT_IO_TIMEOUT_MS.to_string(), "20000".to_string());
+        let resolved = resolver.resolve("memory:/slow").unwrap();
+        assert_eq!(resolved.io_timeout, Some(Duration::from_secs(20)));
+
+        let (op, counts) = crate::timeout_tests::slow(Duration::from_secs(11), Duration::ZERO);
+        let mut slow_storage = resolved.as_ref().clone();
+        slow_storage.storage = OpenDalStorage::Memory(op);
+        // Keep the factory-created timeout, but replace the backend in the cache.
+        resolver
+            .storages
+            .write()
+            .unwrap()
+            .insert("memory", Arc::new(slow_storage));
+        resolver
+            .new_output("memory:/slow")
+            .unwrap()
+            .write("data".into())
+            .await
+            .unwrap();
+        assert_eq!(counts.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[cfg(feature = "opendal-s3")]
     #[test]
     fn test_resolve_s3_aliases_share_instance() {
-        let storage = empty_resolving_storage();
+        let mut storage = empty_resolving_storage();
+        storage.props.insert(
+            iceberg::io::CLIENT_IO_TIMEOUT_MS.to_string(),
+            "20000".to_string(),
+        );
 
         // All three S3-family schemes must collapse to a single cached
-        // `Arc<OpenDalStorage>` so that catalogs handing the resolver a mix
+        // `Arc<ConfiguredStorage>` so that catalogs handing the resolver a mix
         // of `s3://`, `s3a://`, `s3n://` paths don't rebuild operators.
         let a = storage.resolve("s3://bucket/key").unwrap();
         let b = storage.resolve("s3a://bucket/key").unwrap();
         let c = storage.resolve("s3n://bucket/key").unwrap();
 
+        assert_eq!(a.io_timeout, Some(std::time::Duration::from_secs(20)));
         assert!(Arc::ptr_eq(&a, &b), "s3 and s3a should share one instance");
         assert!(Arc::ptr_eq(&a, &c), "s3 and s3n should share one instance");
     }
